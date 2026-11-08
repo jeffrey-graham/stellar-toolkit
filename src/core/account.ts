@@ -8,7 +8,13 @@ import {
 } from 'stellar-sdk';
 import { AccountInfo, Balance, MultiSigConfig } from '../types';
 import { Server } from '../utils/network';
-import { AccountNotFoundError, ValidationError } from '../errors';
+import {
+  AccountNotFoundError,
+  NetworkConnectionError,
+  NetworkTimeoutError,
+  ToolkitError,
+  ValidationError,
+} from '../errors';
 
 export type AccountResponse = Horizon.AccountResponse;
 
@@ -19,6 +25,89 @@ export class AccountManager {
     private server: Server,
     private networkPassphrase = 'Test SDF Network ; September 2015',
   ) {}
+
+  private mapAccountLookupError(publicKey: string, error: unknown): Error {
+    if (error instanceof AccountNotFoundError) {
+      return error;
+    }
+
+    const errObj = error as {
+      name?: string;
+      code?: string;
+      message?: string;
+      status?: number;
+      statusCode?: number;
+      response?: { status?: number; statusCode?: number; statusText?: string };
+    };
+
+    const status =
+      errObj?.response?.status ??
+      errObj?.response?.statusCode ??
+      errObj?.status ??
+      errObj?.statusCode;
+    const code = errObj?.code ?? '';
+    const name = errObj?.name ?? '';
+    const rawMessage =
+      error instanceof Error
+        ? error.message
+        : typeof errObj?.message === 'string'
+          ? errObj.message
+          : String(error);
+
+    if (
+      status === 404 ||
+      name === 'NotFoundError' ||
+      (code !== 'ENOTFOUND' &&
+        typeof status !== 'number' &&
+        (/\b404\b/.test(rawMessage) || /\bnot found\b/i.test(rawMessage)))
+    ) {
+      return new AccountNotFoundError(publicKey);
+    }
+
+    if (error instanceof ToolkitError) {
+      return error;
+    }
+
+    const serverUrl =
+      (
+        this.server as unknown as {
+          serverURL?: { toString(): string };
+        }
+      )?.serverURL?.toString?.() || 'horizon';
+
+    if (
+      typeof status !== 'number' &&
+      (code === 'ETIMEDOUT' ||
+        code === 'ECONNABORTED' ||
+        name === 'TimeoutError' ||
+        /timed?\s*out/i.test(rawMessage))
+    ) {
+      return new NetworkTimeoutError(serverUrl);
+    }
+
+    if (
+      (typeof status === 'number' && status >= 500) ||
+      [
+        'ECONNREFUSED',
+        'ENOTFOUND',
+        'ECONNRESET',
+        'EAI_AGAIN',
+        'ENETUNREACH',
+        'EHOSTUNREACH',
+      ].includes(code) ||
+      /econnrefused|enotfound|econnreset|network|connection|unreachable|\b5\d\d\b|internal server error|bad gateway|service unavailable/i.test(
+        rawMessage,
+      )
+    ) {
+      const detail =
+        typeof status === 'number'
+          ? `HTTP ${status}${rawMessage ? `: ${rawMessage}` : ''}`
+          : rawMessage;
+      return new NetworkConnectionError(serverUrl, detail);
+    }
+
+    return new Error(`Failed to load account ${publicKey}: ${rawMessage}`);
+  }
 
   /**
    * Generate a new Stellar keypair
@@ -38,11 +127,7 @@ export class AccountManager {
     try {
       return await this.server.loadAccount(publicKey);
     } catch (error: unknown) {
-      const status = (error as { response?: { status?: number } })?.response?.status;
-      if (status === 404 || String(error).includes('404') || String(error).includes('Not Found')) {
-        throw new AccountNotFoundError(publicKey);
-      }
-      throw new Error(`Failed to load account ${publicKey}: ${error}`);
+      throw this.mapAccountLookupError(publicKey, error);
     }
   }
 
@@ -59,10 +144,13 @@ export class AccountManager {
    */
   async accountExists(publicKey: string): Promise<boolean> {
     try {
-      await this.server.loadAccount(publicKey);
+      await this.loadAccount(publicKey);
       return true;
-    } catch {
-      return false;
+    } catch (error: unknown) {
+      if (error instanceof AccountNotFoundError) {
+        return false;
+      }
+      throw error;
     }
   }
 
